@@ -1,0 +1,489 @@
+mport sys
+import os
+import threading
+import warnings
+from datetime import datetime
+import requests
+from bs4 import BeautifulSoup
+from PyQt6.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QLabel, QTextEdit, QPushButton, 
+    QHBoxLayout, QFrame, QLineEdit, QListWidget, QListWidgetItem
+)
+from PyQt6.QtCore import Qt, pyqtSignal
+from google import genai
+
+warnings.filterwarnings("ignore")
+
+# ==================== НАСТРОЙКИ ====================
+GEMINI_API_KEY = "ВАШ_GEMINI_API_KEY"  # <-- Вставьте ваш API-ключ Gemini
+KNOWLEDGE_BASE_URL = "https://example.com/kb"  # <-- Ссылка на вашу базу знаний
+HTTP_PROXY_URL = "http://127.0.0.1:10809"       # <-- HTTP-порт Happ
+# ===================================================
+
+# 1. Загрузка базы знаний
+print("1. Загрузка базы знаний...")
+def fetch_knowledge_base(url):
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+        session = requests.Session()
+        session.trust_env = False  
+        
+        response = session.get(url, headers=headers, timeout=5)
+        response.encoding = 'utf-8'
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        for script in soup(["script", "style", "header", "footer", "nav"]):
+            script.extract()
+            
+        text = soup.get_text(separator=' ', strip=True)
+        print("   ✅ База знаний успешно загружена!")
+        return text[:12000]
+    except Exception as e:
+        print(f"   ⚠️ Ошибка загрузки базы знаний: {e}")
+        return "База знаний недоступна."
+
+kb_content = fetch_knowledge_base(KNOWLEDGE_BASE_URL)
+
+# 2. Инициализация Gemini
+print("2. Инициализация Gemini...")
+os.environ["HTTP_PROXY"] = HTTP_PROXY_URL
+os.environ["HTTPS_PROXY"] = HTTP_PROXY_URL
+
+client = genai.Client(api_key=GEMINI_API_KEY)
+
+def get_verified_gemini_model(genai_client):
+    print("   🔍 Поиск и проверка активных моделей...")
+    candidates = ["gemini-1.5-flash", "gemini-1.5-flash-8b", "gemini-1.5-pro"]
+    
+    try:
+        for m in genai_client.models.list():
+            name = m.name.replace("models/", "") if hasattr(m, 'name') else str(m)
+            if name not in candidates:
+                candidates.append(name)
+    except Exception:
+        pass
+
+    for model_id in candidates:
+        try:
+            genai_client.models.generate_content(model=model_id, contents="ping")
+            print(f"   ✅ Подключена модель: '{model_id}'")
+            return model_id
+        except Exception:
+            continue
+
+    return "gemini-1.5-flash"
+
+ACTIVE_MODEL = get_verified_gemini_model(client)
+
+
+# 3. Графический интерфейс AI Copilot Messenger
+class AICopilotMessenger(QWidget):
+    update_item_signal = pyqtSignal(str, str, str, str) # chat_id, msg_id, text, hint
+
+    def __init__(self):
+        super().__init__()
+        self.drag_position = None
+        self.chats = {}           # Структура: {chat_id: {"title": str, "messages": {msg_id: dict}}}
+        self.current_chat_id = None
+        self.chat_counter = 0
+        self.msg_counter = 0
+
+        self.init_ui()
+        self.update_item_signal.connect(self.handle_message_update)
+        
+        # Создаем первый чат по умолчанию
+        self.create_new_chat()
+
+    def init_ui(self):
+        self.setWindowFlags(
+            Qt.WindowType.WindowStaysOnTopHint | 
+            Qt.WindowType.FramelessWindowHint | 
+            Qt.WindowType.Tool
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        
+        self.resize(880, 560)
+        self.setMinimumSize(680, 420)
+
+        # Главный контейнер
+        main_frame = QFrame(self)
+        main_frame.setObjectName("MainFrame")
+        main_frame.setStyleSheet("""
+            QFrame#MainFrame {
+                background-color: rgba(15, 23, 42, 0.96);
+                border: 1px solid rgba(249, 115, 22, 0.3);
+                border-radius: 14px;
+            }
+        """)
+
+        main_layout = QHBoxLayout(main_frame)
+        main_layout.setContentsMargins(10, 10, 10, 10)
+        main_layout.setSpacing(10)
+
+        # ==================== ЛЕВАЯ ПАНЕЛЬ (SIDEBAR) ====================
+        sidebar_frame = QFrame(self)
+        sidebar_frame.setFixedWidth(220)
+        sidebar_frame.setStyleSheet("""
+            QFrame {
+                background: rgba(30, 41, 59, 0.6);
+                border-radius: 10px;
+                border: 1px solid rgba(255, 255, 255, 0.05);
+            }
+        """)
+        sidebar_layout = QVBoxLayout(sidebar_frame)
+        sidebar_layout.setContentsMargins(8, 10, 8, 10)
+        sidebar_layout.setSpacing(10)
+
+        # Шапка сайдбара
+        app_badge = QLabel("⚡ AI Copilot", self)
+        app_badge.setStyleSheet("""
+            color: #F97316;
+            font-size: 15px;
+            font-weight: 800;
+            padding: 4px;
+            border: none;
+        """)
+        sidebar_layout.addWidget(app_badge)
+
+        # Кнопка "Новый чат"
+        self.btn_new_chat = QPushButton("＋ Новый чат", self)
+        self.btn_new_chat.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_new_chat.setStyleSheet("""
+            QPushButton {
+                background: linear-gradient(135deg, #F97316, #EA580C);
+                color: #FFFFFF;
+                font-size: 13px;
+                font-weight: 700;
+                padding: 8px;
+                border: none;
+                border-radius: 6px;
+            }
+            QPushButton:hover {
+                background: linear-gradient(135deg, #FB923C, #F97316);
+            }
+        """)
+        self.btn_new_chat.clicked.connect(self.create_new_chat)
+        sidebar_layout.addWidget(self.btn_new_chat)
+
+        # Список сохраненных диалогов
+        self.chat_list_widget = QListWidget(self)
+        self.chat_list_widget.setStyleSheet("""
+            QListWidget {
+                background: transparent;
+                border: none;
+                outline: none;
+            }
+            QListWidget::item {
+                color: #94A3B8;
+                padding: 8px 10px;
+                border-radius: 6px;
+                margin-bottom: 4px;
+                font-size: 12px;
+            }
+            QListWidget::item:hover {
+                background: rgba(249, 115, 22, 0.15);
+                color: #F1F5F9;
+            }
+            QListWidget::item:selected {
+                background: rgba(249, 115, 22, 0.3);
+                color: #F97316;
+                font-weight: bold;
+                border-left: 3px solid #F97316;
+            }
+        """)
+        self.chat_list_widget.itemClicked.connect(self.on_chat_selected)
+        sidebar_layout.addWidget(self.chat_list_widget)
+
+        main_layout.addWidget(sidebar_frame)
+
+        # ==================== ПРАВАЯ ПАНЕЛЬ (ОКНО ЧАТА) ====================
+        chat_frame = QFrame(self)
+        chat_layout = QVBoxLayout(chat_frame)
+        chat_layout.setContentsMargins(0, 0, 0, 0)
+        chat_layout.setSpacing(8)
+
+        # Шапка чата
+        header_layout = QHBoxLayout()
+        self.label_chat_title = QLabel("💬 Новый диалог", self)
+        self.label_chat_title.setStyleSheet("""
+            color: #F8FAFC;
+            font-size: 13px;
+            font-weight: 600;
+            background: rgba(30, 41, 59, 0.8);
+            padding: 6px 12px;
+            border-radius: 6px;
+        """)
+        header_layout.addWidget(self.label_chat_title)
+        header_layout.addStretch()
+
+        self.btn_close = QPushButton("✕", self)
+        self.btn_close.setFixedWidth(30)
+        self.btn_close.setFixedHeight(30)
+        self.btn_close.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_close.setStyleSheet("""
+            QPushButton {
+                background: rgba(239, 68, 68, 0.2);
+                color: #EF4444;
+                font-size: 13px;
+                font-weight: bold;
+                border: 1px solid rgba(239, 68, 68, 0.4);
+                border-radius: 6px;
+            }
+            QPushButton:hover {
+                background: rgba(239, 68, 68, 0.4);
+                color: #FFFFFF;
+            }
+        """)
+        self.btn_close.clicked.connect(self.close)
+        header_layout.addWidget(self.btn_close)
+
+        chat_layout.addLayout(header_layout)
+
+        # Нейтральный водяной знак на фоне
+        svg_watermark = (
+            "data:image/svg+xml;utf8,"
+            "<svg xmlns='http://www.w3.org/2000/svg' width='400' height='200' viewBox='0 0 400 200'>"
+            "<text x='50%' y='50%' dominant-baseline='middle' text-anchor='middle' fill='%23F97316' fill-opacity='0.05' font-family='Segoe UI, Arial, sans-serif' font-weight='900' font-size='48'>AI ASSISTANT</text>"
+            "</svg>"
+        )
+
+        self.text_display = QTextEdit(self)
+        self.text_display.setReadOnly(True)
+        self.text_display.setPlaceholderText("Задайте вопрос по базе знаний...")
+        self.text_display.setStyleSheet(f"""
+            QTextEdit {{
+                background-color: rgba(2, 6, 23, 0.65);
+                background-image: url("{svg_watermark}");
+                background-position: center;
+                background-repeat: no-repeat;
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                border-radius: 10px;
+                padding: 12px;
+                font-family: 'Segoe UI', Arial, sans-serif;
+            }}
+            QScrollBar:vertical {{
+                border: none;
+                background: rgba(15, 23, 42, 0.5);
+                width: 6px;
+                border-radius: 3px;
+            }}
+            QScrollBar::handle:vertical {{
+                background: #F97316;
+                border-radius: 3px;
+            }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+                height: 0px;
+            }}
+        """)
+        chat_layout.addWidget(self.text_display)
+
+        # Панель ввода
+        input_layout = QHBoxLayout()
+        input_layout.setSpacing(8)
+
+        self.input_field = QLineEdit(self)
+        self.input_field.setPlaceholderText("Введите ваш вопрос или запрос...")
+        self.input_field.setStyleSheet("""
+            QLineEdit {
+                background: rgba(30, 41, 59, 0.9);
+                color: #F8FAFC;
+                font-size: 13px;
+                padding: 10px 12px;
+                border: 1px solid rgba(255, 255, 255, 0.12);
+                border-radius: 8px;
+            }
+            QLineEdit:focus {
+                border: 1px solid #F97316;
+                background: rgba(30, 41, 59, 1);
+            }
+        """)
+        self.input_field.returnPressed.connect(self.send_request)
+        input_layout.addWidget(self.input_field)
+
+        self.btn_send = QPushButton("Отправить", self)
+        self.btn_send.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_send.setStyleSheet("""
+            QPushButton {
+                background: linear-gradient(135deg, #F97316, #EA580C);
+                color: #FFFFFF;
+                font-size: 13px;
+                font-weight: 700;
+                padding: 10px 18px;
+                border: none;
+                border-radius: 8px;
+            }
+            QPushButton:hover {
+                background: linear-gradient(135deg, #FB923C, #F97316);
+            }
+        """)
+        self.btn_send.clicked.connect(self.send_request)
+        input_layout.addWidget(self.btn_send)
+
+        chat_layout.addLayout(input_layout)
+        main_layout.addWidget(chat_frame)
+
+        # Настройка главного окна
+        window_layout = QVBoxLayout(self)
+        window_layout.setContentsMargins(0, 0, 0, 0)
+        window_layout.addWidget(main_frame)
+        self.setLayout(window_layout)
+
+    # ==================== ЛОГИКА МЕССЕНДЖЕРА ====================
+    def create_new_chat(self):
+        self.chat_counter += 1
+        chat_id = f"chat_{self.chat_counter}"
+        title = f"Диалог #{self.chat_counter}"
+
+        self.chats[chat_id] = {
+            "title": title,
+            "messages": {}
+        }
+
+        item = QListWidgetItem(f"💬 {title}")
+        item.setData(Qt.ItemDataRole.UserRole, chat_id)
+        self.chat_list_widget.addItem(item)
+        
+        self.chat_list_widget.setCurrentItem(item)
+        self.switch_to_chat(chat_id)
+
+    def on_chat_selected(self, item):
+        chat_id = item.data(Qt.ItemDataRole.UserRole)
+        self.switch_to_chat(chat_id)
+
+    def switch_to_chat(self, chat_id):
+        self.current_chat_id = chat_id
+        chat_data = self.chats[chat_id]
+        self.label_chat_title.setText(f"💬 {chat_data['title']}")
+        self.render_chat_messages(chat_id)
+
+    def send_request(self):
+        text = self.input_field.text().strip()
+        if not text or not self.current_chat_id:
+            return
+
+        self.input_field.clear()
+        chat_id = self.current_chat_id
+        chat_data = self.chats[chat_id]
+
+        if len(chat_data["messages"]) == 0:
+            new_title = text[:18] + "..." if len(text) > 18 else text
+            chat_data["title"] = new_title
+            self.label_chat_title.setText(f"💬 {new_title}")
+            
+            current_item = self.chat_list_widget.currentItem()
+            if current_item:
+                current_item.setText(f"💬 {new_title}")
+
+        self.msg_counter += 1
+        msg_id = f"msg_{self.msg_counter}"
+
+        self.update_item_signal.emit(chat_id, msg_id, text, "⏳ Gemini формирует развернутый ответ...")
+
+        threading.Thread(
+            target=self.get_gemini_hint, 
+            args=(chat_id, msg_id, text), 
+            daemon=True
+        ).start()
+
+    def handle_message_update(self, chat_id, msg_id, client_text, hint_text):
+        if chat_id not in self.chats:
+            return
+
+        time_str = datetime.now().strftime("%H:%M:%S")
+        self.chats[chat_id]["messages"][msg_id] = {
+            "time": time_str,
+            "client": client_text,
+            "hint": hint_text
+        }
+
+        if self.current_chat_id == chat_id:
+            self.render_chat_messages(chat_id)
+
+    def render_chat_messages(self, chat_id):
+        chat_data = self.chats.get(chat_id, {})
+        messages = chat_data.get("messages", {})
+
+        if not messages:
+            self.text_display.setHtml("")
+            return
+
+        html_blocks = []
+        for m_id, item in messages.items():
+            if "⏳" in item['hint']:
+                hint_style = "color: #FBBF24; font-style: italic;"
+            elif "Ошибка" in item['hint']:
+                hint_style = "color: #F87171;"
+            else:
+                hint_style = "color: #34D399; line-height: 1.4;"
+
+            card_html = f"""
+            <div style="
+                background: rgba(30, 41, 59, 0.75); 
+                border: 1px solid rgba(249, 115, 22, 0.15); 
+                border-radius: 10px; 
+                padding: 10px 14px; 
+                margin-bottom: 12px;">
+                
+                <div style="margin-bottom: 6px;">
+                    <span style="color: #64748B; font-size: 11px; font-weight: 600;">[{item['time']}]</span>
+                    <span style="color: #F97316; font-weight: 700; font-size: 13px; margin-left: 6px;">Запрос:</span>
+                    <span style="color: #F1F5F9; font-size: 13px; margin-left: 4px;">{item['client']}</span>
+                </div>
+                
+                <div style="
+                    background: rgba(15, 23, 42, 0.7); 
+                    border-left: 3px solid #F97316; 
+                    padding: 8px 12px; 
+                    border-radius: 4px; 
+                    margin-top: 6px;">
+                    <div style="color: #10B981; font-weight: 600; font-size: 12px; margin-bottom: 3px;">💡 Ответ Gemini:</div>
+                    <div style="{hint_style} font-size: 13px;">{item['hint']}</div>
+                </div>
+            </div>
+            """
+            html_blocks.append(card_html)
+
+        self.text_display.setHtml("".join(html_blocks))
+        
+        sb = self.text_display.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def get_gemini_hint(self, chat_id, msg_id, customer_text):
+        prompt = f"""
+        Ты — ведущий технический консультант и эксперт поддержки.
+        Поступил запрос/вопрос: "{customer_text}"
+
+        База знаний:
+        ---
+        {kb_content}
+        ---
+
+        Дай полный, развернутый и точный ответ.
+        Используй списки и выделения ключевых моментов для удобства оператора.
+        """
+        try:
+            response = client.models.generate_content(
+                model=ACTIVE_MODEL,
+                contents=prompt
+            )
+            hint = response.text.replace("\n", "<br>")
+            self.update_item_signal.emit(chat_id, msg_id, customer_text, hint)
+        except Exception as e:
+            print(f"Ошибка Gemini ({msg_id}): {e}")
+            self.update_item_signal.emit(chat_id, msg_id, customer_text, f"Ошибка API: {e}")
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.drag_position = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            event.accept()
+
+    def mouseMoveEvent(self, event):
+        if event.buttons() == Qt.MouseButton.LeftButton and self.drag_position is not None:
+            self.move(event.globalPosition().toPoint() - self.drag_position)
+            event.accept()
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = AICopilotMessenger()
+    window.show()
+    sys.exit(app.exec())
